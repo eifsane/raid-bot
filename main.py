@@ -161,8 +161,13 @@ class RaidCreateModal(discord.ui.Modal, title="Создать рейд"):
         self.size = size
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Получаем значения из полей
+        title = self.raid_title.value
+        date = self.raid_date.value
+        time = self.raid_time.value
+
         try:
-            parse_msk_datetime(str(self.raid_date), str(self.raid_time))
+            parse_msk_datetime(date, time)
         except Exception:
             await interaction.response.send_message(
                 "Проверь дату и время. Формат даты: ДД-ММ-ГГГГ, время: ЧЧ:ММ",
@@ -175,10 +180,10 @@ class RaidCreateModal(discord.ui.Modal, title="Создать рейд"):
 
         raids[raid_id] = {
             "id": raid_id,
-            "title": str(self.raid_title),
+            "title": title,
             "size": self.size,
-            "date": str(self.raid_date),
-            "time": str(self.raid_time),
+            "date": date,
+            "time": time,
             "channel_id": str(interaction.channel_id),
             "creator_id": str(interaction.user.id),
             "message_id": "",
@@ -219,21 +224,17 @@ intents.members = True
 
 class RaidBot(commands.Bot):
     async def setup_hook(self):
-        self.add_view(RaidView())
+        self.add_view(RaidView())  # Для постоянных кнопок
 
-        # Убираем очистку команд, чтобы не удалять существующие на сервере
-        # self.tree.clear_commands(guild=GUILD_OBJ)
-
-        # Копируем глобальные команды на сервер (теперь команда raid_create глобальная)
+        # Копируем глобальные команды на сервер
         self.tree.copy_global_to(guild=GUILD_OBJ)
         synced = await self.tree.sync(guild=GUILD_OBJ)
         print(f"✅ Synced {len(synced)} command(s) to guild {GUILD_ID}")
 
 bot = RaidBot(command_prefix="!", intents=intents)
 
-# Команда сделана глобальной (убрано привязывание к серверу)
+# Глобальная команда
 @bot.tree.command(name="raid_create", description="Создать рейд")
-# @app_commands.guilds(GUILD_OBJ)  # закомментировано для глобального доступа
 async def raid_create(interaction: discord.Interaction):
     await interaction.response.send_message(
         "Выбери формат рейда:",
