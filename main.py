@@ -26,7 +26,7 @@ intents.members = True
 
 ROLE_LIMITS = {
     5: {"tank": 1, "heal": 1, "dps": 3, "reserve": 3},
-    10: {"tank": 2, "heal": 2, "dps": 6, "reserve": 5},
+    10: {"tank": 1, "heal": 2, "dps": 7, "reserve": 5},
 }
 
 ROLE_LABELS = {
