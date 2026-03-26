@@ -14,15 +14,10 @@ from discord.ext import tasks
 # CONFIG
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")  # optional: speeds up slash command registration
+GUILD_ID = os.getenv("GUILD_ID")  # ID сервера, куда добавлен бот
 
-# Время рейдов всегда вводится и хранится в МСК
+# Всё время рейдов вводится пользователем в МСК
 MOSCOW_TZ = timezone(timedelta(hours=3))
-
-# Локальное время для показа в скобках.
-# Пример для Греции: зимой 2, летом 3.
-LOCAL_TIME_OFFSET = int(os.getenv("LOCAL_TIME_OFFSET", "2"))
-LOCAL_TZ = timezone(timedelta(hours=LOCAL_TIME_OFFSET))
 
 DATA_FILE = Path("raids.json")
 
@@ -133,28 +128,34 @@ def now_moscow() -> datetime:
     return datetime.now(MOSCOW_TZ)
 
 
-def format_dt(dt_str: str) -> str:
-    dt = datetime.fromisoformat(dt_str).astimezone(MOSCOW_TZ)
-    return dt.strftime("%d.%m.%Y %H:%M")
-
-
-def format_dt_with_local(dt_str: str) -> str:
-    msk_dt = datetime.fromisoformat(dt_str).astimezone(MOSCOW_TZ)
-    local_dt = msk_dt.astimezone(LOCAL_TZ)
-
-    if LOCAL_TIME_OFFSET == 3:
-        return f"{msk_dt.strftime('%d.%m.%Y %H:%M')} МСК"
-
-    return (
-        f"{msk_dt.strftime('%d.%m.%Y %H:%M')} МСК "
-        f"({local_dt.strftime('%d.%m.%Y %H:%M')} локальное)"
-    )
-
-
 def parse_date_time(date_str: str, time_str: str) -> datetime:
-    # Expected: 26.03.2026 and 20:30
+    # Формат: 26.03.2026 и 20:30
     dt = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
     return dt.replace(tzinfo=MOSCOW_TZ)
+
+
+def moscow_plain_text(dt_str: str) -> str:
+    dt = datetime.fromisoformat(dt_str).astimezone(MOSCOW_TZ)
+    return dt.strftime("%d.%m.%Y %H:%M МСК")
+
+
+def discord_timestamp_full(dt_str: str) -> str:
+    dt = datetime.fromisoformat(dt_str).astimezone(MOSCOW_TZ)
+    unix_ts = int(dt.timestamp())
+    return f"<t:{unix_ts}:F>"
+
+
+def discord_timestamp_short(dt_str: str) -> str:
+    dt = datetime.fromisoformat(dt_str).astimezone(MOSCOW_TZ)
+    unix_ts = int(dt.timestamp())
+    return f"<t:{unix_ts}:t>"
+
+
+def raid_time_block(dt_str: str) -> str:
+    return (
+        f"**По МСК:** {moscow_plain_text(dt_str)}\n"
+        f"**Ваше локальное:** {discord_timestamp_full(dt_str)}"
+    )
 
 
 def mention_list(signups: List[dict]) -> str:
@@ -170,6 +171,32 @@ def sort_signups(signups: List[dict]) -> Dict[str, List[dict]]:
     return grouped
 
 
+def build_ordered_signups(signups: List[dict]) -> List[dict]:
+    role_order = {"tank": 0, "heal": 1, "dps": 2, "reserve": 3}
+    return sorted(signups, key=lambda x: (role_order[x["role"]], x["joined_at"]))
+
+
+def promote_reserves(raid: dict):
+    config = RAID_TEMPLATES[raid["size"]]
+    signups = raid["signups"]
+
+    # Берём резервистов по очереди записи
+    reserves = [s for s in signups if s["role"] == "reserve"]
+    reserves.sort(key=lambda x: x["joined_at"])
+
+    main_signups = [s for s in signups if s["role"] != "reserve"]
+
+    for role in ["tank", "heal", "dps"]:
+        current = [s for s in main_signups if s["role"] == role]
+        while len(current) < config[role] and reserves:
+            promoted = reserves.pop(0)
+            promoted["role"] = role
+            current.append(promoted)
+            main_signups.append(promoted)
+
+    raid["signups"] = build_ordered_signups(main_signups + reserves)
+
+
 def raid_embed(raid: dict) -> discord.Embed:
     config = RAID_TEMPLATES[raid["size"]]
     grouped = sort_signups(raid["signups"])
@@ -177,10 +204,10 @@ def raid_embed(raid: dict) -> discord.Embed:
     embed = discord.Embed(
         title=f"⚔️ {raid['title']}",
         description=(
-            f"**Дата и время:** {format_dt_with_local(raid['raid_datetime'])}\n"
+            f"{raid_time_block(raid['raid_datetime'])}\n"
             f"**Формат:** {raid['size']} человек\n"
             f"**Создал:** <@{raid['creator_id']}>\n\n"
-            f"Нажми кнопку ниже, чтобы записаться."
+            f"Ниже выбери роль для записи."
         ),
     )
 
@@ -211,7 +238,7 @@ def raid_embed(raid: dict) -> discord.Embed:
         inline=False,
     )
 
-    embed.set_footer(text="Если роль занята, бот отправит тебя в резерв.")
+    embed.set_footer(text="Если основной слот роли занят, бот отправит тебя в резерв.")
     return embed
 
 
@@ -241,7 +268,7 @@ async def create_discussion_thread(message: discord.Message, raid: dict):
             auto_archive_duration=1440,
         )
         await thread.send(
-            f"Тема для обсуждения рейда **{raid['title']}**. Здесь можно писать детали, сбор, замены и т.д."
+            f"Тема для обсуждения рейда **{raid['title']}**. Здесь можно писать детали, сбор, замены и всё остальное."
         )
         raid["thread_id"] = thread.id
         store.update(message.id, raid)
@@ -301,7 +328,6 @@ class RaidCreateModal(discord.ui.Modal, title="Создать рейд"):
         raid["message_id"] = msg.id
         store.create_raid(raid)
 
-        # Rebind the view with the real message id
         await msg.edit(view=RaidSignupView(msg.id))
         await create_discussion_thread(msg, raid)
 
@@ -347,8 +373,8 @@ class RoleSelect(discord.ui.Select):
 
         chosen = self.values[0]
         config = RAID_TEMPLATES[raid["size"]]
-
         signups = raid["signups"]
+
         existing = next((s for s in signups if s["user_id"] == interaction.user.id), None)
         if existing:
             signups.remove(existing)
@@ -373,11 +399,7 @@ class RoleSelect(discord.ui.Select):
             )
         )
 
-        # Keep a nice order: tanks, heals, dps, reserve
-        role_order = {"tank": 0, "heal": 1, "dps": 2, "reserve": 3}
-        signups.sort(key=lambda x: (role_order[x["role"]], x["joined_at"]))
-
-        raid["signups"] = signups
+        raid["signups"] = build_ordered_signups(signups)
         store.update(self.message_id, raid)
         await update_raid_message(self.message_id)
 
@@ -409,20 +431,7 @@ class RaidSignupView(discord.ui.View):
             await interaction.response.send_message("Ты не был(а) записан(а) на этот рейд.", ephemeral=True)
             return
 
-        # promote reserve if slots opened
-        config = RAID_TEMPLATES[raid["size"]]
-        for role in ["tank", "heal", "dps"]:
-            current = [s for s in raid["signups"] if s["role"] == role]
-            reserves = [s for s in raid["signups"] if s["role"] == "reserve"]
-            while len(current) < config[role] and reserves:
-                promoted = reserves.pop(0)
-                promoted["role"] = role
-                current.append(promoted)
-
-        # rebuild ordered list after promotions
-        role_order = {"tank": 0, "heal": 1, "dps": 2, "reserve": 3}
-        raid["signups"].sort(key=lambda x: (role_order[x["role"]], x["joined_at"]))
-
+        promote_reserves(raid)
         store.update(self.message_id, raid)
         await update_raid_message(self.message_id)
         await interaction.response.send_message("Ты отписался(ась) от рейда.", ephemeral=True)
@@ -453,7 +462,7 @@ async def raid_list(interaction: discord.Interaction):
 
     raids.sort(key=lambda r: r["raid_datetime"])
     lines = [
-        f"• **{r['title']}** — {format_dt_with_local(r['raid_datetime'])}, формат {r['size']}, [сообщение](https://discord.com/channels/{r['guild_id']}/{r['channel_id']}/{r['message_id']})"
+        f"• **{r['title']}** — {moscow_plain_text(r['raid_datetime'])} | ваше время: {discord_timestamp_full(r['raid_datetime'])}"
         for r in raids
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -508,14 +517,18 @@ async def raid_notifier():
 
         if not raid["notified_1h"] and timedelta(minutes=0) <= (raid_dt - now) <= timedelta(minutes=60):
             await channel.send(
-                f"⏰ {mentions}\nЧерез **час** начинается рейд **{raid['title']}** в **{format_dt_with_local(raid['raid_datetime'])}**."
+                f"⏰ {mentions}\nЧерез **час** начинается рейд **{raid['title']}**.\n"
+                f"**По МСК:** {moscow_plain_text(raid['raid_datetime'])}\n"
+                f"**Ваше локальное время:** {discord_timestamp_full(raid['raid_datetime'])}"
             )
             raid["notified_1h"] = True
             store.update(raid["message_id"], raid)
 
         if not raid["notified_start"] and timedelta(minutes=-1) <= (raid_dt - now) <= timedelta(minutes=1):
             await channel.send(
-                f"🚨 {mentions}\nРейд **{raid['title']}** начинается **сейчас**! Время рейда: **{format_dt_with_local(raid['raid_datetime'])}**."
+                f"🚨 {mentions}\nРейд **{raid['title']}** начинается **сейчас**!\n"
+                f"**По МСК:** {moscow_plain_text(raid['raid_datetime'])}\n"
+                f"**Ваше локальное время:** {discord_timestamp_full(raid['raid_datetime'])}"
             )
             raid["notified_start"] = True
             store.update(raid["message_id"], raid)
@@ -536,18 +549,21 @@ async def before_notifier():
 async def on_ready():
     logger.info("Logged in as %s (%s)", client.user, client.user.id)
 
-    # Persistent views for existing raids after restart
     for raid in store.all():
         client.add_view(RaidSignupView(raid["message_id"]))
 
-    if GUILD_ID:
-        guild = discord.Object(id=int(GUILD_ID))
-        tree.copy_global_to(guild=guild)
-        await tree.sync(guild=guild)
-        logger.info("Commands synced to guild %s", GUILD_ID)
-    else:
-        await tree.sync()
-        logger.info("Global commands synced")
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            await tree.sync(guild=guild)
+            logger.info("Commands synced to guild %s", GUILD_ID)
+        else:
+            await tree.sync()
+            logger.info("Global commands synced")
+    except discord.Forbidden:
+        logger.exception("Нет доступа для sync команд. Проверь правильность GUILD_ID и что бот добавлен на этот сервер.")
+    except Exception:
+        logger.exception("Ошибка при sync slash-команд")
 
     if not raid_notifier.is_running():
         raid_notifier.start()
