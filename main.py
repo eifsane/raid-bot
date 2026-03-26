@@ -2,7 +2,7 @@ import os
 import json
 import datetime
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -18,8 +18,12 @@ try:
 except ValueError:
     raise RuntimeError("GUILD_ID должен быть числом.")
 
-GUILD_OBJ = discord.Object(id=GUILD_ID)
+GUILD = discord.Object(id=GUILD_ID)
 DATA_FILE = "raids.json"
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
 
 ROLE_LIMITS = {
     5: {"tank": 1, "heal": 1, "dps": 3, "reserve": 3},
@@ -52,33 +56,32 @@ def parse_msk_datetime(date_str: str, time_str: str) -> datetime.datetime:
     msk = datetime.timezone(datetime.timedelta(hours=3))
     return datetime.datetime(year, month, day, hour, minute, tzinfo=msk)
 
-def discord_ts(date_str: str, time_str: str) -> str:
+def ts_for_discord(date_str: str, time_str: str) -> str:
     dt = parse_msk_datetime(date_str, time_str)
     return f"<t:{int(dt.timestamp())}:F>"
 
-def mention_list(user_ids):
-    return " ".join(f"<@{uid}>" for uid in user_ids) if user_ids else "—"
+def mention_text(user_ids):
+    return "\n".join(f"<@{uid}>" for uid in user_ids) if user_ids else "—"
 
-def build_embed(raid_id: str, raid: dict) -> discord.Embed:
+def make_embed(raid_id: str, raid: dict) -> discord.Embed:
     embed = discord.Embed(
         title=f"Рейд: {raid['title']}",
-        colour=discord.Colour.blurple()
+        color=discord.Color.blurple()
     )
     embed.add_field(name="Формат", value=f"{raid['size']} человек", inline=True)
     embed.add_field(name="Дата", value=raid["date"], inline=True)
     embed.add_field(
         name="Время",
-        value=f"{raid['time']} МСК\n{discord_ts(raid['date'], raid['time'])}",
+        value=f"{raid['time']} МСК\n{ts_for_discord(raid['date'], raid['time'])}",
         inline=False
     )
 
     for role in ["tank", "heal", "dps", "reserve"]:
-        users = raid["signups"].get(role, [])
-        limit = ROLE_LIMITS[raid["size"]][role]
+        users = raid["signups"][role]
         embed.add_field(
-            name=f"{ROLE_LABELS[role]} ({len(users)}/{limit})",
-            value=mention_list(users),
-            inline=False,
+            name=f"{ROLE_LABELS[role]} ({len(users)}/{ROLE_LIMITS[raid['size']][role]})",
+            value=mention_text(users),
+            inline=False
         )
 
     embed.set_footer(text=f"ID: {raid_id}")
@@ -88,7 +91,7 @@ class RaidView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def refresh_message(self, raid_id: str):
+    async def update_raid_message(self, raid_id: str):
         raids = load_raids()
         raid = raids.get(raid_id)
         if not raid:
@@ -99,10 +102,19 @@ class RaidView(discord.ui.View):
             channel = await bot.fetch_channel(int(raid["channel_id"]))
 
         message = await channel.fetch_message(int(raid["message_id"]))
-        await message.edit(embed=build_embed(raid_id, raid), view=self)
+        await message.edit(embed=make_embed(raid_id, raid), view=self)
 
-    async def signup(self, interaction: discord.Interaction, role: str):
-        raid_id = interaction.message.embeds[0].footer.text.replace("ID: ", "")
+    async def join_role(self, interaction: discord.Interaction, role: str):
+        if not interaction.message or not interaction.message.embeds:
+            await interaction.response.send_message("Не удалось найти рейд.", ephemeral=True)
+            return
+
+        footer = interaction.message.embeds[0].footer.text or ""
+        if not footer.startswith("ID: "):
+            await interaction.response.send_message("Не удалось найти ID рейда.", ephemeral=True)
+            return
+
+        raid_id = footer.replace("ID: ", "").strip()
         raids = load_raids()
         raid = raids.get(raid_id)
 
@@ -119,39 +131,39 @@ class RaidView(discord.ui.View):
         if role == "leave":
             text = "Ты отписался(ась) от рейда."
         else:
-            role_limit = ROLE_LIMITS[raid["size"]][role]
-            if len(raid["signups"][role]) < role_limit:
+            limit = ROLE_LIMITS[raid["size"]][role]
+            if len(raid["signups"][role]) < limit:
                 raid["signups"][role].append(user_id)
-                text = f"Ты записан(а) в роль: {ROLE_LABELS[role]}"
+                text = f"Ты записан(а) в {ROLE_LABELS[role]}."
             else:
                 reserve_limit = ROLE_LIMITS[raid["size"]]["reserve"]
                 if len(raid["signups"]["reserve"]) < reserve_limit:
                     raid["signups"]["reserve"].append(user_id)
-                    text = "Основной слот заполнен, ты записан(а) в резерв."
+                    text = "Основное место занято, ты добавлен(а) в резерв."
                 else:
-                    text = "Мест больше нет: и основной слот, и резерв заполнены."
+                    text = "Нет мест: основной состав и резерв заполнены."
 
         save_raids(raids)
-        await self.refresh_message(raid_id)
+        await self.update_raid_message(raid_id)
         await interaction.response.send_message(text, ephemeral=True)
 
     @discord.ui.button(label="Танк", style=discord.ButtonStyle.primary, custom_id="raid_tank")
-    async def tank_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.signup(interaction, "tank")
+    async def tank_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.join_role(interaction, "tank")
 
     @discord.ui.button(label="Хил", style=discord.ButtonStyle.success, custom_id="raid_heal")
-    async def heal_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.signup(interaction, "heal")
+    async def heal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.join_role(interaction, "heal")
 
     @discord.ui.button(label="ДД", style=discord.ButtonStyle.secondary, custom_id="raid_dps")
-    async def dps_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.signup(interaction, "dps")
+    async def dps_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.join_role(interaction, "dps")
 
     @discord.ui.button(label="Отписаться", style=discord.ButtonStyle.danger, custom_id="raid_leave")
-    async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.signup(interaction, "leave")
+    async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.join_role(interaction, "leave")
 
-class RaidCreateModal(discord.ui.Modal, title="Создать рейд"):
+class RaidModal(discord.ui.Modal, title="Создать рейд"):
     raid_title = discord.ui.TextInput(label="Название рейда", max_length=100)
     raid_date = discord.ui.TextInput(label="Дата (ДД-ММ-ГГГГ)", placeholder="27-03-2026", max_length=10)
     raid_time = discord.ui.TextInput(label="Время по МСК (ЧЧ:ММ)", placeholder="18:00", max_length=5)
@@ -180,20 +192,17 @@ class RaidCreateModal(discord.ui.Modal, title="Создать рейд"):
             "date": str(self.raid_date),
             "time": str(self.raid_time),
             "channel_id": str(interaction.channel_id),
-            "creator_id": str(interaction.user.id),
             "message_id": "",
             "thread_id": "",
-            "notified_1h": False,
-            "notified_start": False,
             "signups": {"tank": [], "heal": [], "dps": [], "reserve": []},
         }
 
         view = RaidView()
-        msg = await interaction.channel.send(embed=build_embed(raid_id, raids[raid_id]), view=view)
-        raids[raid_id]["message_id"] = str(msg.id)
+        message = await interaction.channel.send(embed=make_embed(raid_id, raids[raid_id]), view=view)
+        raids[raid_id]["message_id"] = str(message.id)
 
         try:
-            thread = await msg.create_thread(name=f"Обсуждение: {raids[raid_id]['title']}")
+            thread = await message.create_thread(name=f"Обсуждение: {raids[raid_id]['title']}")
             raids[raid_id]["thread_id"] = str(thread.id)
         except Exception as e:
             print(f"Не удалось создать ветку: {e}")
@@ -206,34 +215,25 @@ class RaidSizeView(discord.ui.View):
         super().__init__(timeout=120)
 
     @discord.ui.button(label="Рейд на 5", style=discord.ButtonStyle.primary)
-    async def create_5(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RaidCreateModal(5))
+    async def five_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RaidModal(5))
 
     @discord.ui.button(label="Рейд на 10", style=discord.ButtonStyle.success)
-    async def create_10(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RaidCreateModal(10))
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
+    async def ten_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RaidModal(10))
 
 class RaidBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(RaidView())
-
-        try:
-            self.tree.clear_commands(guild=GUILD_OBJ)
-        except Exception as e:
-            print(f"clear_commands warning: {e}")
-
-        self.tree.copy_global_to(guild=GUILD_OBJ)
-        synced = await self.tree.sync(guild=GUILD_OBJ)
+        # Очень простая и надежная синхронизация только в один сервер
+        synced = await self.tree.sync(guild=GUILD)
         print(f"✅ Synced {len(synced)} command(s) to guild {GUILD_ID}")
+        for cmd in synced:
+            print(f"   - /{cmd.name}")
 
 bot = RaidBot(command_prefix="!", intents=intents)
 
-@bot.tree.command(name="raid_create", description="Создать рейд")
-@app_commands.guilds(GUILD_OBJ)
+@bot.tree.command(name="raid_create", description="Создать рейд", guild=GUILD)
 async def raid_create(interaction: discord.Interaction):
     await interaction.response.send_message(
         "Выбери формат рейда:",
@@ -241,56 +241,9 @@ async def raid_create(interaction: discord.Interaction):
         ephemeral=True
     )
 
-@tasks.loop(minutes=1)
-async def notifier_loop():
-    raids = load_raids()
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    changed = False
-
-    for raid_id, raid in raids.items():
-        try:
-            raid_dt = parse_msk_datetime(raid["date"], raid["time"])
-        except Exception:
-            continue
-
-        diff = raid_dt.astimezone(datetime.timezone.utc) - now_utc
-        minutes_left = int(diff.total_seconds() // 60)
-
-        user_ids = (
-            raid["signups"]["tank"]
-            + raid["signups"]["heal"]
-            + raid["signups"]["dps"]
-            + raid["signups"]["reserve"]
-        )
-        mentions = " ".join(f"<@{uid}>" for uid in user_ids).strip()
-        if not mentions:
-            mentions = "@everyone"
-
-        channel = bot.get_channel(int(raid["channel_id"]))
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(int(raid["channel_id"]))
-            except Exception:
-                continue
-
-        if not raid["notified_1h"] and 59 <= minutes_left <= 60:
-            await channel.send(f"{mentions}\nЧерез 1 час начнётся рейд **{raid['title']}**.")
-            raid["notified_1h"] = True
-            changed = True
-
-        if not raid["notified_start"] and -1 <= minutes_left <= 0:
-            await channel.send(f"{mentions}\nРейд **{raid['title']}** начинается сейчас.")
-            raid["notified_start"] = True
-            changed = True
-
-    if changed:
-        save_raids(raids)
-
 @bot.event
 async def on_ready():
     print(f"🤖 Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"🏠 Working guild ID: {GUILD_ID}")
-    if not notifier_loop.is_running():
-        notifier_loop.start()
+    print(f"🏠 Guild ID: {GUILD_ID}")
 
 bot.run(DISCORD_TOKEN)
